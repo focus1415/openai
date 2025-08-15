@@ -50,6 +50,20 @@ IMAGE_EXT_MAP = {
 TEXT_LIKE = {".txt", ".md", ".csv", ".log"}
 PDF_LIKE = {".pdf"}
 
+# โมเดลให้เลือกใน dropdown (ปรับตามสิทธิ์ที่คุณมี)
+MODEL_CHOICES = [
+    "openai/gpt-4.1",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "gpt-4.1-mini",      # ถ้ามีสิทธิ์ใช้
+    "phi-3.5-mini-instruct",  # ตัวอย่าง non-OpenAI บางตัว
+    "meta/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "deepseek/DeepSeek-R1-0528",  # DeepSeek R1
+    "xai/grok-3",
+    # เพิ่ม/ลบได้ตามต้องการ
+]
+
+
 def is_image(path: str) -> bool:
     mt, _ = mimetypes.guess_type(path)
     return (mt or "").startswith("image/")
@@ -269,17 +283,24 @@ with gr.Blocks(theme="soft") as demo:
         "- โมเดลเริ่มต้น: `openai/gpt-4.1`\n"
     )
 
+    # สร้างคอมโพเนนต์ไว้ก่อน จะได้อ้างอิงซ้ำ/แก้ไขง่าย
+    sys_tb = gr.Textbox(value="You are a helpful assistant.", label="System Prompt")
+    model_dd = gr.Dropdown(
+        choices=MODEL_CHOICES,
+        value=MODEL,                 # ค่าตั้งต้นจาก .env
+        allow_custom_value=True,     # ให้พิมพ์ชื่อโมเดลอื่นเองได้
+        label="Model",
+        interactive=True,
+    )
+    max_tokens_sl = gr.Slider(64, 4096, value=512, step=64, label="max_tokens")
+    temp_sl = gr.Slider(0.0, 1.0, value=0.2, step=0.1, label="temperature")
+
     chat = gr.ChatInterface(
         fn=chat_fn,
-        multimodal=True,  # ส่ง text+files ได้
+        multimodal=True,
         title="Multimodal ChatBot",
         description="แนบรูปหรือไฟล์ในช่องอินพุตได้เลย จากนั้นพิมพ์คำถาม",
-        additional_inputs=[
-            gr.Textbox(value="You are a helpful assistant.", label="System Prompt"),
-            gr.Textbox(value=MODEL, label="Model"),
-            gr.Slider(64, 4096, value=512, step=64, label="max_tokens"),
-            gr.Slider(0.0, 1.0, value=0.2, step=0.1, label="temperature"),
-        ],
+        additional_inputs=[sys_tb, model_dd, max_tokens_sl, temp_sl],
     )
 
 if __name__ == "__main__":
