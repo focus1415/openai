@@ -34,6 +34,11 @@ client = ChatCompletionsClient(
     credential=AzureKeyCredential(GITHUB_TOKEN),
 )
 
+# === Token usage (session accumulators) ===
+SESSION_PROMPT_TOKENS = 0
+SESSION_COMPLETION_TOKENS = 0
+SESSION_TOTAL_TOKENS = 0
+
 # -------- Helpers --------
 IMAGE_EXT_MAP = {
     ".jpg": "jpeg",
@@ -72,7 +77,6 @@ def read_text_from_file(path: str, max_chars: int = 20000) -> str:
 def image_to_content_item(path: str) -> ImageContentItem:
     _, ext = os.path.splitext(path.lower())
     img_fmt = IMAGE_EXT_MAP.get(ext, "png")  # default png
-    # สร้าง data URL ผ่าน SDK โดยอัตโนมัติ
     img_url = ImageUrl.load(image_file=path, image_format=img_fmt)
     return ImageContentItem(image_url=img_url)
 
@@ -98,25 +102,21 @@ def history_to_messages(history: List[Any]) -> List[Any]:
             if isinstance(u, str) and u.strip():
                 msgs.append(UserMessage(content=[to_text_item(u)]))
             elif isinstance(u, dict) and "text" in u:
-                # ถ้าเผื่อ history เก็บ dict ของ multimodal
                 text_u = u.get("text") or ""
                 msgs.append(UserMessage(content=[to_text_item(text_u)]))
 
             if isinstance(a, str) and a.strip():
                 msgs.append(AssistantMessage(content=[to_text_item(a)]))
 
-        # รูปแบบ dict ตาม type="messages" (ถ้าใช้ในอนาคต)
+        # รูปแบบ dict ตาม type="messages"
         elif isinstance(turn, dict) and "role" in turn and "content" in turn:
             role = turn["role"]
             content = turn["content"]
-            # แปลงเป็น TextContent อย่างง่าย
             text_join = ""
             if isinstance(content, list):
-                # ดึงเฉพาะข้อความ
                 text_join = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
             elif isinstance(content, str):
                 text_join = content
-
             if role == "user":
                 msgs.append(UserMessage(content=[to_text_item(text_join)]))
             elif role == "assistant":
@@ -130,6 +130,8 @@ def chat_fn(message, history, system_prompt, model_name, max_tokens, temperature
     message: dict {"text": str, "files": [tmp_paths]}
     history: previous chat display (list)
     """
+    global SESSION_PROMPT_TOKENS, SESSION_COMPLETION_TOKENS, SESSION_TOTAL_TOKENS
+
     t0 = time.perf_counter()
 
     # เตรียมข้อความระบบ
@@ -188,8 +190,42 @@ def chat_fn(message, history, system_prompt, model_name, max_tokens, temperature
         out = str(content)
 
     latency_ms = (time.perf_counter() - t0) * 1000
-    # แสดง latency เล็กน้อยท้ายข้อความ (ช่วยดีบัก)
-    out += f"\n\n---\n(latency: {latency_ms:.0f} ms)"
+
+    # === Token usage ===
+    u = getattr(resp, "usage", None)
+    per_prompt = per_completion = per_total = None
+    tps = None
+    if u:
+        # สำหรับ SDK นี้ โดยปกติจะมี usage: prompt_tokens, completion_tokens, total_tokens
+        per_prompt = getattr(u, "prompt_tokens", None)
+        per_completion = getattr(u, "completion_tokens", None)
+        per_total = getattr(u, "total_tokens", None)
+
+        if isinstance(per_prompt, int):
+            SESSION_PROMPT_TOKENS += per_prompt
+        if isinstance(per_completion, int):
+            SESSION_COMPLETION_TOKENS += per_completion
+        if isinstance(per_total, int):
+            SESSION_TOTAL_TOKENS += per_total
+
+        if per_total and latency_ms > 0:
+            tps = per_total / (latency_ms / 1000.0)
+
+    # ต่อท้ายรายงานสั้น ๆ
+    report_lines = [f"(latency: {latency_ms:.0f} ms)"]
+    if per_total is not None:
+        report_lines.append(
+            f"tokens — prompt:{per_prompt} | completion:{per_completion} | total:{per_total}"
+        )
+        report_lines.append(
+            f"session — prompt:{SESSION_PROMPT_TOKENS} | completion:{SESSION_COMPLETION_TOKENS} | total:{SESSION_TOTAL_TOKENS}"
+        )
+        if tps is not None:
+            report_lines.append(f"throughput: {tps:.2f} tok/s")
+    else:
+        report_lines.append("tokens — (no usage returned by API)")
+
+    out += "\n\n---\n" + " | ".join(report_lines)
 
     return out
 
@@ -209,10 +245,9 @@ with gr.Blocks(theme="soft") as demo:
         additional_inputs=[
             gr.Textbox(value="You are a helpful assistant.", label="System Prompt"),
             gr.Textbox(value=MODEL, label="Model"),
-            gr.Slider(64, 2048, value=512, step=64, label="max_tokens"),
+            gr.Slider(64, 4096, value=512, step=64, label="max_tokens"),
             gr.Slider(0.0, 1.0, value=0.2, step=0.1, label="temperature"),
         ],
-        # อย่าใส่ retry_btn / undo_btn / clear_btn ใน v5
     )
 
 if __name__ == "__main__":
