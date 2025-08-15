@@ -23,7 +23,7 @@ client = ChatCompletionsClient(
 )
 
 # แนบภาพจาก URL (แนะนำให้ใช้ URL ที่เข้าถึงได้สาธารณะ)
-img = ImageUrl(url="https://t90181206027.p.clickup-attachments.com/t90181206027/c5bdc07b-f73f-47ee-9f3f-115e48af5f65/image.png")
+img = ImageUrl(url=r"https://www.bloggang.com/data/mormaew/picture/1172407260.jpg")
 
 messages = [
     SystemMessage(content="You are a helpful assistant."),

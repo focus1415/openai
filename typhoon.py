@@ -53,7 +53,7 @@ def extract_text_from_image(image_path, api_key, params):
 
 # Usage
 api_key = "<YOUR_API_KEY>"
-image_path = r"C:\Users\Focus\Desktop\openai\openai\p1.jpg"  # or path/to/your/document.pdf
+image_path = r"C:\Users\Focus\Desktop\openai\openai\image.png"  # or path/to/your/document.pdf
 model = "typhoon-ocr-preview"
 params = {
     "model": model,
