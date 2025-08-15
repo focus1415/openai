@@ -5,7 +5,7 @@ if hasattr(sys.stdout, "reconfigure"):
 import os
 import time
 import mimetypes
-from typing import List, Tuple, Any
+from typing import List, Any, Dict
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -20,7 +20,7 @@ from azure.core.credentials import AzureKeyCredential
 
 # === Minimal file parsers ===
 from PyPDF2 import PdfReader
-from PIL import Image
+from PIL import Image  # noqa: F401  # (เพียงเพื่อให้แน่ใจว่า PIL พร้อมใช้งาน)
 
 import gradio as gr
 
@@ -47,7 +47,6 @@ IMAGE_EXT_MAP = {
     ".webp": "webp",
     ".bmp": "bmp",
 }
-
 TEXT_LIKE = {".txt", ".md", ".csv", ".log"}
 PDF_LIKE = {".pdf"}
 
@@ -124,6 +123,31 @@ def history_to_messages(history: List[Any]) -> List[Any]:
 
     return msgs
 
+def parse_rate_limit_headers(h: Dict[str, str]) -> str:
+    """
+    รับ headers (lowercase keys) แล้วสรุปผลคงเหลือของ rate-limit ถ้ามี
+    รองรับทั้งรูปแบบ x-ratelimit-*-requests/tokens และแบบ generic
+    """
+    rl_req_rem   = h.get("x-ratelimit-remaining-requests") or h.get("x-ratelimit-remaining-requests-per-minute")
+    rl_req_lim   = h.get("x-ratelimit-limit-requests") or h.get("x-ratelimit-limit-requests-per-minute")
+    rl_req_reset = h.get("x-ratelimit-reset-requests") or h.get("x-ratelimit-reset-requests-per-minute")
+
+    rl_tok_rem   = h.get("x-ratelimit-remaining-tokens") or h.get("x-ratelimit-remaining")
+    rl_tok_lim   = h.get("x-ratelimit-limit-tokens") or h.get("x-ratelimit-limit")
+    rl_tok_reset = h.get("x-ratelimit-reset-tokens") or h.get("x-ratelimit-reset")
+
+    retry_after  = h.get("retry-after")
+
+    parts = []
+    if rl_req_rem or rl_req_lim:
+        parts.append(f"reqs: {rl_req_rem or '?'} / {rl_req_lim or '?'} (reset {rl_req_reset or '?'})")
+    if rl_tok_rem or rl_tok_lim:
+        parts.append(f"tokens/min: {rl_tok_rem or '?'} / {rl_tok_lim or '?'} (reset {rl_tok_reset or '?'})")
+    if retry_after:
+        parts.append(f"retry-after: {retry_after}s")
+
+    return "rate-limit — " + (" | ".join(parts) if parts else "headers not provided by endpoint")
+
 # -------- Core chat function for Gradio --------
 def chat_fn(message, history, system_prompt, model_name, max_tokens, temperature):
     """
@@ -132,21 +156,25 @@ def chat_fn(message, history, system_prompt, model_name, max_tokens, temperature
     """
     global SESSION_PROMPT_TOKENS, SESSION_COMPLETION_TOKENS, SESSION_TOTAL_TOKENS
 
-    t0 = time.perf_counter()
+    # --- เก็บ headers จาก response ผ่าน hook ---
+    last_headers = {}
+    def _hook(resp):
+        try:
+            h = resp.http_response.headers  # azure.core.rest.HttpResponse.headers
+            nonlocal last_headers
+            last_headers = {k.lower(): v for k, v in h.items()}
+        except Exception as e:
+            last_headers = {"_hook_error": str(e)}
 
-    # เตรียมข้อความระบบ
+    # เตรียมข้อความระบบ + history
     messages = []
     if system_prompt and system_prompt.strip():
         messages.append(SystemMessage(content=system_prompt.strip()))
-
-    # นำ history เดิมเข้าเป็นบริบท (ข้อความล้วน)
     messages.extend(history_to_messages(history))
 
     # แตกไฟล์จาก message (image & docs)
     user_text = (message or {}).get("text") or ""
     files = (message or {}).get("files") or []
-
-    # แยก image กับ non-image
     image_files = [f for f in files if is_image(f)]
     other_files = [f for f in files if not is_image(f)]
 
@@ -154,34 +182,38 @@ def chat_fn(message, history, system_prompt, model_name, max_tokens, temperature
     if user_text.strip():
         user_contents.append(to_text_item(user_text.strip()))
 
-    # แนบรูปเข้าคอนเทนต์ (รองรับหลายรูป)
     for path in image_files:
         try:
             user_contents.append(image_to_content_item(path))
         except Exception as e:
             user_contents.append(to_text_item(f"[Image load error: {os.path.basename(path)}: {e}]"))
 
-    # Extract ข้อความจากไฟล์ที่ไม่ใช่รูป (txt/pdf ฯลฯ)
     for path in other_files:
         snippet = read_text_from_file(path, max_chars=12000)
         header = f"\n--- file: {os.path.basename(path)} ---\n"
         user_contents.append(to_text_item(header + snippet))
 
-    # ถ้าไม่มีอะไรเลย ก็ส่งข้อความเปล่าไป (กัน error)
     if not user_contents:
         user_contents = [to_text_item("")]
 
     messages.append(UserMessage(content=user_contents))
 
-    # เรียกโมเดล
-    resp = client.complete(
-        messages=messages,
-        model=model_name or MODEL,
-        max_tokens=int(max_tokens),
-        temperature=float(temperature),
-    )
+    # เรียกโมเดล + วัด API latency
+    t_api_start = time.perf_counter()
+    try:
+        resp = client.complete(
+            messages=messages,
+            model=model_name or MODEL,
+            max_tokens=int(max_tokens),
+            temperature=float(temperature),
+            raw_response_hook=_hook,    # <<<< ดึง headers ที่นี่
+        )
+    except Exception as e:
+        return f"❌ API error: {e}"
 
-    # ดึงข้อความตอบกลับ (รองรับกรณี content เป็น list ของ content items)
+    t_api_ms = (time.perf_counter() - t_api_start) * 1000.0
+
+    # ดึงข้อความตอบกลับ
     msg = resp.choices[0].message
     content = msg.content
     if isinstance(content, list):
@@ -189,14 +221,11 @@ def chat_fn(message, history, system_prompt, model_name, max_tokens, temperature
     else:
         out = str(content)
 
-    latency_ms = (time.perf_counter() - t0) * 1000
-
     # === Token usage ===
     u = getattr(resp, "usage", None)
     per_prompt = per_completion = per_total = None
     tps = None
     if u:
-        # สำหรับ SDK นี้ โดยปกติจะมี usage: prompt_tokens, completion_tokens, total_tokens
         per_prompt = getattr(u, "prompt_tokens", None)
         per_completion = getattr(u, "completion_tokens", None)
         per_total = getattr(u, "total_tokens", None)
@@ -208,11 +237,14 @@ def chat_fn(message, history, system_prompt, model_name, max_tokens, temperature
         if isinstance(per_total, int):
             SESSION_TOTAL_TOKENS += per_total
 
-        if per_total and latency_ms > 0:
-            tps = per_total / (latency_ms / 1000.0)
+        if per_total and t_api_ms > 0:
+            tps = per_total / (t_api_ms / 1000.0)
 
-    # ต่อท้ายรายงานสั้น ๆ
-    report_lines = [f"(latency: {latency_ms:.0f} ms)"]
+    # === Rate limit (จาก headers ถ้ามี) ===
+    rate_line = parse_rate_limit_headers(last_headers)
+
+    # === สรุปท้ายข้อความ ===
+    report_lines = [f"(api latency: {t_api_ms:.0f} ms)"]
     if per_total is not None:
         report_lines.append(
             f"tokens — prompt:{per_prompt} | completion:{per_completion} | total:{per_total}"
@@ -224,9 +256,9 @@ def chat_fn(message, history, system_prompt, model_name, max_tokens, temperature
             report_lines.append(f"throughput: {tps:.2f} tok/s")
     else:
         report_lines.append("tokens — (no usage returned by API)")
+    report_lines.append(rate_line)
 
     out += "\n\n---\n" + " | ".join(report_lines)
-
     return out
 
 # -------- UI --------
@@ -251,4 +283,5 @@ with gr.Blocks(theme="soft") as demo:
     )
 
 if __name__ == "__main__":
+    # ปล. ปิดเซิร์ฟเวอร์ด้วย Ctrl+C ในเทอร์มินัล
     demo.launch(server_name="127.0.0.1", server_port=7860, show_api=False)
